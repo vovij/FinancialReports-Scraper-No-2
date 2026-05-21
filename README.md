@@ -80,12 +80,3 @@ With those in hand, the approach would be:
 3. The existing pagination loop then works unchanged — it walks whatever result set the filter left active.
 
 For a full backfill runner you'd wrap this in a list of (company, date-range) tuples and iterate, re-bootstrapping the session between runs to avoid state bleed.
-
----
-
-## Notes & known limitations
-
-- **`_VIKEY_` rotation** — Catalyst can issue a new `_VIKEY_` on certain state transitions. The scraper uses the initial token throughout; if a session mid-run returns a new token in its response, it would need to be picked up and threaded forward. Not observed in testing, but worth watching.
-- **Selector fragility** — `a.appDocumentLink` and `a.appMenuItem` are stable Catalyst class names, but a portal upgrade could rename them. A retry with a broader row-level selector would be a good addition.
-- **Rate limiting** — A 1.2 s sleep between pages is conservative. Imperva fingerprints more on TLS/header consistency than raw timing, but backing off further is easy via `--sleep`.
-- **No retries** — Downloads fail hard. Production use would want `tenacity` or a manual retry loop.
