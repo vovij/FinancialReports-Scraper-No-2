@@ -79,11 +79,11 @@ def load_page1() -> tuple[httpx.Client, BeautifulSoup, str, str, str, str]:
 
     # _CBNODE_: results widget that handles selectPage (dynamic per session)
     nodes = re.findall(r"'(W\d+)','selectPage'", r.text)
-    cbnode = nodes[0] if nodes else "W1030"
+    cbnode = nodes[0] if nodes else "W1030" # use fallback in case
 
     # _CBHTMLFRAGNODEID_: AsyncWrapper container node (dynamic per session)
     frag_m = re.search(r"AsyncWrapper(W\d+)", r.text)
-    fragnode = frag_m.group(1) if frag_m else "W167"
+    fragnode = frag_m.group(1) if frag_m else "W167" # use fallback in case
 
     print(f"[init] view_id  : {view_id}")
     print(f"[init] vikey    : {vikey[:16]}...")
