@@ -1,89 +1,105 @@
 import time
-import json
+import re
 from pathlib import Path
 from bs4 import BeautifulSoup
-from session import build_client, init_session, BASE_URL
+from session import get_session, BASE_URL
 
-# Paste your cookies from DevTools here
-COOKIES = {
-    "JSESSIONID":                "YKFKQKv9mkPGQ8hsNceYy4X6cha-JgEnSQDuIlItPcg9faNCm30T!-1524954598",  # keep old one if not in new list
-    "TS01bfbdd0":                "016abe8a180a7ca13f5302535237b58bd21fc2e2a54717689d36b4085c8369f1ada439681617b008cd3f59435a90f12672bbcd878fffd02230d1d554d989654d0e71a245d7fc734e5f0a611c1e7ca3dad3b6b7eab6070ed77222e0d3c1bcea336c381ddfc27dfdd44fe9428defa3633a5f7440191c",
-    "x-catalyst-session-global": "59909a21660cac3ab91f1e49adeae2dc344ade3f56ed88e3d3e12d4defb079e429e3d66e1071c27d",
-    "x-catalyst-locale":         "en",
-    "x-catalyst-timezone":       "EST5EDT",
-    "__uzma":                    "3aeb8b9e-4367-48e4-843f-3c5e80777437",
-    "__uzmb":                    "1779363273",
-    "__uzmc":                    "609111955942",
-    "__uzmd":                    "1779363282",
-    "__uzme":                    "6287",
-    "__uzmf":                    "7f90003aeb8b9e-4367-48e4-843f-3c5e807774371-17793632739348890-0038c92d83f4bf02ce819",
-    "uzmx":                      "7f9000b2a49f90-eb47-4938-87aa-0cd17f1459821-17793632739348890-ed7a6f9c70c3e09919",
-    "__ssds":                    "0",
-    "__ssuzjsr0":                "a9be0cd8e",
-}
-
-def fetch_page(client, meta, frag_id, filters={}):
+def fetch_page(client, meta, page_num: int) -> BeautifulSoup:
+    """
+    Replicates: catHtmlFragmentCallback('W231', 'selectPage', <page_num>, {
+        containerNodeId: 'W167', asyncUpdate: true, ...
+    })
+    """
     payload = {
-        "nodeW551-filterSQL":     "contains",
-        "nodeW552ac":             "",
-        "DocumentContent":        "",
-        "nodeW559-searchOp":      "EqualsIgnoreCase",
-        "nodeW560-AnyAllFilter":  "any",
-        "FilingIdentifier":       filters.get("filing_id", ""),
-        "FilingCategory":         filters.get("category", "securitiesofferings"),
-        "SubmissionDate":         filters.get("date_from", ""),
-        "SubmissionDate2":        filters.get("date_to", ""),
-        "_CBASYNCUPDATE_":        "true",
-        "_CBHTMLFRAGNODEID_":     "W534",
-        "_CBHTMLFRAGID_":         str(frag_id),
-        "_CBHTMLFRAG_":           "true",
-        "_CBNODE_":               "W563",
-        "_VIKEY_":                meta["vikey"],
-        "_CBNAME_":               "fireOnChange",
+        "_VIKEY_":            meta["vikey"],
+        "_CBNODE_":           "W231",
+        "_CBNAME_":           "selectPage",
+        "_CBVALUE_":          str(page_num),
+        "_CBASYNCUPDATE_":    "true",
+        "_CBHTMLFRAG_":       "true",
+        "_CBHTMLFRAGNODEID_": "W167",
     }
     url = f"{BASE_URL}/csa-party/viewInstance/view.html?id={meta['view_id']}"
-    r = client.post(url, data=payload)
+    r = client.post(url, data=payload, headers={"Referer": url})
     r.raise_for_status()
     return BeautifulSoup(r.text, "html.parser")
 
-def parse_filings(soup):
-    # Inspect the HTML response in DevTools → Response tab to get real selectors
-    rows = soup.select("tr.filing-row")  # placeholder — check actual class names
+def parse_filings(soup: BeautifulSoup) -> list[dict]:
     filings = []
-    for row in rows:
+    for row in soup.select("tr.appTblRow[class*='searchDocuments']"):
+        # Skip header row
+        if row.find("th"):
+            continue
+
+        # Company name
+        company_tag = row.select_one("a.appMenuItem span.appReceiveFocus")
+        company = company_tag.text.strip() if company_tag else ""
+
+        # Document link + name
+        doc_tag = row.select_one("a.appDocumentLink")
+        doc_url  = doc_tag["href"] if doc_tag else ""
+        doc_name = doc_tag.text.strip() if doc_tag else ""
+
+        # Submission date
+        date_tag = row.select_one("div[id*='SubmissionDate'] span[aria-hidden='true']")
+        date = date_tag.text.strip() if date_tag else ""
+
+        # Jurisdiction
+        juris_tag = row.select_one("div[id*='PrincipalJurisdictionCode'] div.appAttrValue")
+        jurisdiction = juris_tag.text.strip() if juris_tag else ""
+
+        # File size
+        size_tag = row.select_one("div[id*='DocumentSize'] div.appAttrValue")
+        size = size_tag.text.strip() if size_tag else ""
+
         filings.append({
-            "id":       row.get("data-id"),
-            "company":  row.select_one(".company-name").text.strip(),
-            "doc_url":  row.select_one("a")["href"],
+            "company":      company,
+            "doc_name":     doc_name,
+            "doc_url":      doc_url,
+            "date":         date,
+            "jurisdiction": jurisdiction,
+            "size":         size,
         })
     return filings
 
-def download_doc(client, filing, out_dir: Path):
-    out_dir.mkdir(exist_ok=True)
+def download_doc(client, filing: dict, out_dir: Path):
+    if not filing["doc_url"]:
+        return
     r = client.get(filing["doc_url"])
-    fname = out_dir / f"{filing['id']}.pdf"
-    fname.write_bytes(r.content)
-    print(f"  saved → {fname}")
+    r.raise_for_status()
+    # Use doc name as filename, fall back to URL fragment
+    safe_name = re.sub(r'[^\w\-.]', '_', filing["doc_name"]) or "doc"
+    path = out_dir / safe_name
+    # Avoid overwriting duplicates
+    if path.exists():
+        stem, suffix = path.stem, path.suffix
+        path = out_dir / f"{stem}_{hash(filing['doc_url']) % 9999}{suffix}"
+    path.write_bytes(r.content)
+    print(f"    saved → {path.name} ({len(r.content) // 1024} KB)")
 
-def run(pages=3, filters={}):
-    client = build_client(COOKIES)
-    meta = init_session(client)
-    print(f"Session OK — VIKEY: {meta['vikey'][:12]}...")
+def run(pages: int = 3, download: bool = True):
+    client, meta = get_session()
+    print(f"[scraper] session OK — view_id: {meta['view_id'][:20]}...")
 
     out_dir = Path("downloads")
-    frag_id = 1779362227212  # starting value from your recon — increment each page
+    out_dir.mkdir(exist_ok=True)
 
-    for page in range(pages):
-        print(f"Fetching page {page + 1}...")
-        soup = fetch_page(client, meta, frag_id + page, filters)
+    # Page 1 is already in the session HTML — but we POST for it too
+    # so the response is the async fragment (consistent with pages 2+)
+    for page_num in range(1, pages + 1):
+        print(f"\n[scraper] fetching page {page_num}...")
+        soup = fetch_page(client, meta, page_num)
         filings = parse_filings(soup)
-        
-        for filing in filings:
-            download_doc(client, filing, out_dir)
-        
-        time.sleep(1)  # be polite
+        print(f"[scraper] found {len(filings)} filings")
 
-    print("Done.")
+        for f in filings:
+            print(f"  {f['date']}  {f['company'][:50]}  {f['doc_name']}")
+            if download:
+                download_doc(client, f, out_dir)
+
+        time.sleep(1)
+
+    print(f"\n[scraper] done.")
 
 if __name__ == "__main__":
-    run(pages=3)
+    run(pages=3, download=True)
