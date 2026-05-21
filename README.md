@@ -44,7 +44,7 @@ Selects `tr.appTblRow` rows, skipping header rows. Extracts:
 
 ### Download (`download`)
 
-Streams each document URL with the same session client (cookies intact). Filenames are sanitised and de-duplicated with a counter suffix.
+Document links point directly to resource.html with a session-scoped drr token and a per-document drmKey. The endpoint is protected by Radware WAF, which blocks requests that don't look browser-like even with valid session cookies. The fix is sending the full sec-fetch-* header set (sec-fetch-site: same-origin, sec-fetch-mode: navigate, sec-fetch-dest: document, sec-fetch-user: ?1) alongside a correct Referer. Without these, Radware returns an hCaptcha challenge page instead of the PDF. Filenames are sanitised and de-duplicated with a counter suffix.
 
 ---
 
