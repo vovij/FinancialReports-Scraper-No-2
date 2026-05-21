@@ -49,7 +49,7 @@ def load_page1() -> tuple[httpx.Client, BeautifulSoup, str, str, str, str]:
                headers={**HEADERS, "sec-fetch-site": "none",
                         "sec-fetch-mode": "navigate", "sec-fetch-dest": "document"})
 
-    # create.html → 302 → view.html?id=<hex>, issues JSESSIONID + TS01bfbdd0
+    # create.html → 302 → view.html?id=<hex>, issues JSESSIONID + TS01* cookie
     r = client.get(CREATE_URL,
                    params={"targetAppCode": "csa-party",
                            "service": "searchDocuments", "_locale": "en"},
@@ -79,36 +79,34 @@ def load_page1() -> tuple[httpx.Client, BeautifulSoup, str, str, str, str]:
 
     # _CBNODE_: results widget that handles selectPage (dynamic per session)
     nodes = re.findall(r"'(W\d+)','selectPage'", r.text)
-    cbnode = nodes[0] if nodes else "W1030" # use fallback in case
+    cbnode = nodes[0] if nodes else "W1030"
 
     # _CBHTMLFRAGNODEID_: AsyncWrapper container node (dynamic per session)
     frag_m = re.search(r"AsyncWrapper(W\d+)", r.text)
-    fragnode = frag_m.group(1) if frag_m else "W167" # use fallback in case
+    fragnode = frag_m.group(1) if frag_m else "W167"
 
-    print(f"[init] view_id  : {view_id}")
-    print(f"[init] vikey    : {vikey[:16]}...")
-    print(f"[init] cbnode   : {cbnode}")
-    print(f"[init] fragnode : {fragnode}")
+    print(f"[init] view_id={view_id}  vikey={vikey[:8]}...  cbnode={cbnode}  fragnode={fragnode}")
     return client, soup, view_id, vikey, cbnode, fragnode
 
 # ── Pagination ────────────────────────────────────────────────────────────────
 
 def fetch_page(client: httpx.Client, view_id: str, vikey: str,
                cbnode: str, fragnode: str, page_num: int) -> BeautifulSoup:
-    url = f"{BASE_URL}/csa-party/viewInstance/update.html?id={view_id}"
-    payload = {
-        "_VIKEY_":            vikey,
-        "_CBNODE_":           cbnode,
-        "_CBNAME_":           "selectPage",
-        "_CBVALUE_":          str(page_num),
-        "_CBASYNCUPDATE_":    "true",
-        "_CBHTMLFRAG_":       "true",
-        "_CBHTMLFRAGNODEID_": fragnode,
-        "_CBHTMLFRAGID_":     str(int(time.time() * 1000)),
-    }
-    r = client.post(url, data=payload, headers={
-        "Referer": f"{BASE_URL}/csa-party/viewInstance/view.html?id={view_id}",
-    })
+    """POST to Catalyst update endpoint to get the next page of results."""
+    r = client.post(
+        f"{BASE_URL}/csa-party/viewInstance/update.html?id={view_id}",
+        data={
+            "_VIKEY_":            vikey,
+            "_CBNODE_":           cbnode,
+            "_CBNAME_":           "selectPage",
+            "_CBVALUE_":          str(page_num),
+            "_CBASYNCUPDATE_":    "true",
+            "_CBHTMLFRAG_":       "true",
+            "_CBHTMLFRAGNODEID_": fragnode,
+            "_CBHTMLFRAGID_":     str(int(time.time() * 1000)),
+        },
+        headers={"Referer": f"{BASE_URL}/csa-party/viewInstance/view.html?id={view_id}"},
+    )
     r.raise_for_status()
     return BeautifulSoup(r.text, "html.parser")
 
@@ -132,21 +130,40 @@ def parse_filings(soup: BeautifulSoup) -> list[dict]:
 
 # ── Download ──────────────────────────────────────────────────────────────────
 
-def download(client: httpx.Client, filing: dict, out_dir: Path):
+def download(client: httpx.Client, filing: dict, out_dir: Path, view_id: str):
+    """
+    Download a filing document.
+
+    NOTE: SEDAR+ document URLs are protected by Radware/Imperva WAF.
+    The GET to resource.html requires the TS01* session cookie issued during
+    the initial page load. If downloads return captcha pages, the WAF has
+    flagged the session — see README for workaround notes.
+    """
     url = filing["doc_url"]
     if not url:
         return
 
+    r = client.get(url, headers={
+        **HEADERS,
+        "Referer":        f"{BASE_URL}/csa-party/viewInstance/view.html?id={view_id}",
+        "sec-fetch-site": "same-origin",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-dest": "document",
+        "sec-fetch-user": "?1",
+    })
+    r.raise_for_status()
+
+    if r.content[:4] != b"%PDF":
+        print(f"    ✗ blocked (captcha) — {filing['doc_name']}")
+        return
+
     safe = re.sub(r'[^\w\-.]', '_', filing["doc_name"]) or "doc"
-    # Avoid collisions by appending a counter if the filename exists
     path = out_dir / safe
     counter = 1
     while path.exists():
         path = out_dir / f"{Path(safe).stem}_{counter}{Path(safe).suffix}"
         counter += 1
 
-    r = client.get(url)
-    r.raise_for_status()
     path.write_bytes(r.content)
     print(f"    ✓ {path.name}  ({len(r.content) // 1024} KB)")
 
@@ -154,19 +171,17 @@ def download(client: httpx.Client, filing: dict, out_dir: Path):
 
 def run(max_pages: int, do_download: bool):
     OUT_DIR.mkdir(exist_ok=True)
-
     client, soup, view_id, vikey, cbnode, fragnode = load_page1()
 
     for page_num in range(1, max_pages + 1):
         print(f"\n[page {page_num}]")
-
         filings = parse_filings(soup)
         print(f"  {len(filings)} filings")
 
         for f in filings:
             print(f"  {f['company'][:45]}  {f['doc_name']}")
             if do_download:
-                download(client, f, OUT_DIR)
+                download(client, f, OUT_DIR, view_id)
 
         if page_num >= max_pages:
             break
