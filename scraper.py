@@ -1,101 +1,114 @@
 """
-SEDAR+ scraper — minimal and working.
+SEDAR+ document scraper.
 
-Key findings from page_dump.html diagnosis:
-- POST endpoint is /viewInstance/update.html (NOT view.html)
-- _CBHTMLFRAG_ + _CBHTMLFRAGNODEID_=W167 required; server returns fragment HTML only
-- _CBVALUE_ is 1-based (page 2 = "2", page 3 = "3", etc.)
-- Page 1 is loaded via GET; subsequent pages via POST to update.html
+Pulls filings from the general list, downloads attached documents,
+and walks through multiple pages.
+
+Usage:
+    python scraper.py
+    python scraper.py --pages 10
+    python scraper.py --no-download
 """
 
 import re
 import time
+import argparse
 from pathlib import Path
 
 import httpx
 from bs4 import BeautifulSoup
 
-# ── Config ────────────────────────────────────────────────────────────────────
-
-BASE_URL = "https://www.sedarplus.ca"
-VIEW_ID  = "0c11f8b7998bcd966133b671f299339ae40216b61518a131"
-OUT_DIR  = Path("downloads")
-MAX_PAGES = 5
-SLEEP_S   = 1.2
+BASE_URL   = "https://www.sedarplus.ca"
+CREATE_URL = f"{BASE_URL}/csa-party/service/create.html"
+OUT_DIR    = Path("downloads")
+MAX_PAGES  = 5
+SLEEP_S    = 1.2
 
 HEADERS = {
-    "User-Agent":      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
-    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-# Refresh from browser DevTools → Network → any request → Cookie header
-COOKIES = {
-    "JSESSIONID":                "YKFKQKv9mkPGQ8hsNceYy4X6cha-JgEnSQDuIlItPcg9faNCm30T!-1524954598",
-    "TS01bfbdd0":                "016abe8a181dbd8aabcf0fcea07d9145ed512f75432f653609a0d867daccf2ac861d75a7b23331d6bb7e863454d7cd13be72110a218b31da73456633b8b6c2af8dc946140ad6b6ed58697e607501016ed48de2666fdf1ad0558e93ed47d7470e817d074721340541063ae2300b2fc085a6f9a52a336c4d2b246b5b70ec0da9daa3c0178c4a",
-    "x-catalyst-session-global": "dc27043bec1f81f49bcae196919f71d38b825a75341a805bdaaafc826ec3ee083d838acc5d8ef846",
-    "x-catalyst-locale":         "en",
-    "x-catalyst-timezone":       "EST5EDT",
-    "__uzma":                    "e270f475-72ce-40f8-922d-549e26e25158",
-    "__uzmb":                    "1779132652",
-    "__uzmc":                    "9564510682120",
-    "__uzmd":                    "1779364633",
-    "__uzme":                    "3949",
-    "__uzmf":                    "7f9000e270f475-72ce-40f8-922d-549e26e251582-1779132652876231980134-003f3539e0fb639483b106",
-    "uzmx":                      "7f9000ed22e935-f6c1-424a-b594-5f06c75ea7b02-1779132652876231980134-a72114179260eb6d106",
-    "__ssds":                    "0",
-    "__ssuzjsr0":                "a9be0cd8e",
+    "User-Agent":         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+    "Accept":             "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language":    "en-US,en;q=0.9",
+    "sec-ch-ua":          '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"',
+    "sec-ch-ua-mobile":   "?0",
+    "sec-ch-ua-platform": '"macOS"',
+    "upgrade-insecure-requests": "1",
 }
 
 # ── Session ───────────────────────────────────────────────────────────────────
 
-def make_client() -> httpx.Client:
-    return httpx.Client(headers=HEADERS, cookies=COOKIES,
-                        follow_redirects=True, timeout=30.0)
+def load_page1() -> tuple[httpx.Client, BeautifulSoup, str, str, str, str]:
+    """
+    Bootstrap a fresh session and load page 1.
+    Returns (client, soup, view_id, vikey, cbnode, fragnode).
+    All Catalyst widget IDs extracted dynamically — nothing hardcoded.
+    """
+    client = httpx.Client(headers=HEADERS, follow_redirects=True, timeout=30.0)
 
+    # Warm up Imperva
+    client.get(f"{BASE_URL}/home/",
+               headers={**HEADERS, "sec-fetch-site": "none",
+                        "sec-fetch-mode": "navigate", "sec-fetch-dest": "document"})
 
-def load_page1(client: httpx.Client) -> tuple[BeautifulSoup, str]:
-    """GET page 1 and extract vikey."""
-    url = f"{BASE_URL}/csa-party/viewInstance/view.html?id={VIEW_ID}"
-    r = client.get(url)
-    r.raise_for_status()
-    if "sedarplus.ca" not in str(r.url):
-        raise RuntimeError("Cookies expired — grab fresh ones from DevTools.")
+    # create.html → 302 → view.html?id=<hex>, issues JSESSIONID + TS01bfbdd0
+    r = client.get(CREATE_URL,
+                   params={"targetAppCode": "csa-party",
+                           "service": "searchDocuments", "_locale": "en"},
+                   headers={**HEADERS, "Referer": f"{BASE_URL}/home/",
+                            "sec-fetch-site": "same-origin", "sec-fetch-mode": "navigate",
+                            "sec-fetch-dest": "document", "sec-fetch-user": "?1"})
+    m = re.search(r"[?&]id=([a-f0-9]+)", str(r.url))
+    if not m:
+        raise RuntimeError("Session bootstrap failed — create.html did not redirect to view.html.")
+    view_id = m.group(1)
+
+    # Load page 1
+    r = client.get(f"{BASE_URL}/csa-party/viewInstance/view.html?id={view_id}",
+                   headers={**HEADERS, "Referer": f"{BASE_URL}/home/",
+                            "sec-fetch-site": "same-origin", "sec-fetch-mode": "navigate",
+                            "sec-fetch-dest": "document"})
     soup = BeautifulSoup(r.text, "html.parser")
 
+    # _VIKEY_: Catalyst session key
     tag = soup.find("input", {"name": "_VIKEY_"})
-    if tag:
-        vikey = tag["value"]
-    else:
-        m = re.search(r"viewInstanceKey\s*[=:'\"]+\s*([a-f0-9x]+)", r.text)
-        vikey = m.group(1) if m else ""
+    vikey = tag["value"] if tag else ""
+    if not vikey:
+        m2 = re.search(r"viewInstanceKey\s*[=:'\"]+\s*([a-f0-9x]+)", r.text)
+        vikey = m2.group(1) if m2 else ""
+    if not vikey:
+        raise RuntimeError("Could not extract _VIKEY_ from view.html.")
 
-    print(f"[init] vikey={vikey[:16]}...")
-    return soup, vikey
+    # _CBNODE_: results widget that handles selectPage (dynamic per session)
+    nodes = re.findall(r"'(W\d+)','selectPage'", r.text)
+    cbnode = nodes[0] if nodes else "W1030"
+
+    # _CBHTMLFRAGNODEID_: AsyncWrapper container node (dynamic per session)
+    frag_m = re.search(r"AsyncWrapper(W\d+)", r.text)
+    fragnode = frag_m.group(1) if frag_m else "W167"
+
+    print(f"[init] view_id  : {view_id}")
+    print(f"[init] vikey    : {vikey[:16]}...")
+    print(f"[init] cbnode   : {cbnode}")
+    print(f"[init] fragnode : {fragnode}")
+    return client, soup, view_id, vikey, cbnode, fragnode
 
 # ── Pagination ────────────────────────────────────────────────────────────────
 
-def fetch_page(client: httpx.Client, vikey: str, page_num: int) -> BeautifulSoup:
-    """
-    POST to update.html (the correct Catalyst async endpoint).
-    Returns the fragment HTML injected into #AsyncWrapperW167.
-    """
-    # update.html, not view.html
-    url = f"{BASE_URL}/csa-party/viewInstance/update.html?id={VIEW_ID}"
-    ref = f"{BASE_URL}/csa-party/viewInstance/view.html?id={VIEW_ID}"
-
+def fetch_page(client: httpx.Client, view_id: str, vikey: str,
+               cbnode: str, fragnode: str, page_num: int) -> BeautifulSoup:
+    url = f"{BASE_URL}/csa-party/viewInstance/update.html?id={view_id}"
     payload = {
         "_VIKEY_":            vikey,
-        "_CBNODE_":           "W231",
+        "_CBNODE_":           cbnode,
         "_CBNAME_":           "selectPage",
-        "_CBVALUE_":          str(page_num),   # 1-based: page 2 → "2"
+        "_CBVALUE_":          str(page_num),
         "_CBASYNCUPDATE_":    "true",
         "_CBHTMLFRAG_":       "true",
-        "_CBHTMLFRAGNODEID_": "W167",
+        "_CBHTMLFRAGNODEID_": fragnode,
         "_CBHTMLFRAGID_":     str(int(time.time() * 1000)),
     }
-    r = client.post(url, data=payload, headers={"Referer": ref})
+    r = client.post(url, data=payload, headers={
+        "Referer": f"{BASE_URL}/csa-party/viewInstance/view.html?id={view_id}",
+    })
     r.raise_for_status()
     return BeautifulSoup(r.text, "html.parser")
 
@@ -123,39 +136,34 @@ def download(client: httpx.Client, filing: dict, out_dir: Path):
     url = filing["doc_url"]
     if not url:
         return
+
+    safe = re.sub(r'[^\w\-.]', '_', filing["doc_name"]) or "doc"
+    # Avoid collisions by appending a counter if the filename exists
+    path = out_dir / safe
+    counter = 1
+    while path.exists():
+        path = out_dir / f"{Path(safe).stem}_{counter}{Path(safe).suffix}"
+        counter += 1
+
     r = client.get(url)
     r.raise_for_status()
-    safe = re.sub(r'[^\w\-.]', '_', filing["doc_name"]) or "doc"
-    path = out_dir / safe
-    if path.exists():
-        path = out_dir / f"{path.stem}_{abs(hash(url)) % 9999}{path.suffix}"
     path.write_bytes(r.content)
     print(f"    ✓ {path.name}  ({len(r.content) // 1024} KB)")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def run(max_pages: int = MAX_PAGES, do_download: bool = True):
+def run(max_pages: int, do_download: bool):
     OUT_DIR.mkdir(exist_ok=True)
-    client = make_client()
 
-    print("[*] Loading page 1...")
-    soup, vikey = load_page1(client)
-
-    seen: set[str] = set()
+    client, soup, view_id, vikey, cbnode, fragnode = load_page1()
 
     for page_num in range(1, max_pages + 1):
-        print(f"\n[*] Page {page_num}")
+        print(f"\n[page {page_num}]")
 
         filings = parse_filings(soup)
-        new = [f for f in filings if f["doc_url"] not in seen]
-        seen.update(f["doc_url"] for f in new)
-        print(f"    {len(new)} new filings")
+        print(f"  {len(filings)} filings")
 
-        if not new and page_num > 1:
-            print("    All dupes — pagination stalled. Stopping.")
-            break
-
-        for f in new:
+        for f in filings:
             print(f"  {f['company'][:45]}  {f['doc_name']}")
             if do_download:
                 download(client, f, OUT_DIR)
@@ -163,13 +171,17 @@ def run(max_pages: int = MAX_PAGES, do_download: bool = True):
         if page_num >= max_pages:
             break
 
-        # Fetch next page
-        print(f"    → fetching page {page_num + 1}...")
-        soup = fetch_page(client, vikey, page_num + 1)
+        print(f"  → fetching page {page_num + 1}...")
+        soup = fetch_page(client, view_id, vikey, cbnode, fragnode, page_num + 1)
         time.sleep(SLEEP_S)
 
-    print(f"\n[done] {len(seen)} unique filings collected.")
+    total = sum(1 for _ in OUT_DIR.iterdir()) if do_download else 0
+    print(f"\n[done] {max_pages} pages scraped. Files in downloads/: {total}")
 
 
 if __name__ == "__main__":
-    run(max_pages=MAX_PAGES, do_download=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--pages", type=int, default=MAX_PAGES, help="Pages to scrape (default: 5)")
+    parser.add_argument("--no-download", action="store_true", help="List filings only, skip downloads")
+    args = parser.parse_args()
+    run(args.pages, not args.no_download)
