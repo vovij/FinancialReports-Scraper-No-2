@@ -15,7 +15,7 @@ import time
 import argparse
 from pathlib import Path
 
-import httpx
+from curl_cffi import requests as curl_requests
 from bs4 import BeautifulSoup
 
 BASE_URL   = "https://www.sedarplus.ca"
@@ -36,13 +36,13 @@ HEADERS = {
 
 # ── Session ───────────────────────────────────────────────────────────────────
 
-def load_page1() -> tuple[httpx.Client, BeautifulSoup, str, str, str, str]:
+def load_page1() -> tuple[curl_requests.Session, BeautifulSoup, str, str, str, str]:
     """
     Bootstrap a fresh session and load page 1.
     Returns (client, soup, view_id, vikey, cbnode, fragnode).
     All Catalyst widget IDs extracted dynamically — nothing hardcoded.
     """
-    client = httpx.Client(headers=HEADERS, follow_redirects=True, timeout=30.0)
+    client = curl_requests.Session(impersonate="chrome", headers=HEADERS)
 
     # Warm up Imperva
     client.get(f"{BASE_URL}/home/",
@@ -90,7 +90,7 @@ def load_page1() -> tuple[httpx.Client, BeautifulSoup, str, str, str, str]:
 
 # ── Pagination ────────────────────────────────────────────────────────────────
 
-def fetch_page(client: httpx.Client, view_id: str, vikey: str,
+def fetch_page(client: curl_requests.Session, view_id: str, vikey: str,
                cbnode: str, fragnode: str, page_num: int) -> BeautifulSoup:
     """POST to Catalyst update endpoint to get the next page of results."""
     r = client.post(
@@ -132,7 +132,7 @@ def parse_filings(soup: BeautifulSoup) -> list[dict]:
 
 # ── Download ──────────────────────────────────────────────────────────────────
 
-def download(client: httpx.Client, filing: dict, out_dir: Path, view_id: str):
+def download(client: curl_requests.Session, filing: dict, out_dir: Path, view_id: str):
     """
     Download a filing document.
 
