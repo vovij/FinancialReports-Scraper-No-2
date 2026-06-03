@@ -94,18 +94,20 @@ def fetch_page(client: httpx.Client, view_id: str, vikey: str,
                cbnode: str, fragnode: str, page_num: int) -> BeautifulSoup:
     """POST to Catalyst update endpoint to get the next page of results."""
     r = client.post(
-        f"{BASE_URL}/csa-party/viewInstance/update.html?id={view_id}",
+        f"{BASE_URL}/csa-party/viewInstance/update.html?id={view_id}",  # scopes request to our session
         data={
-            "_VIKEY_":            vikey,
-            "_CBNODE_":           cbnode,
-            "_CBNAME_":           "selectPage",
-            "_CBVALUE_":          str(page_num),
-            "_CBASYNCUPDATE_":    "true",
-            "_CBHTMLFRAG_":       "true",
-            "_CBHTMLFRAGNODEID_": fragnode,
-            "_CBHTMLFRAGID_":     str(int(time.time() * 1000)),
+            "_VIKEY_":            vikey,       # Catalyst session token
+            "_CBNODE_":           cbnode,      # widget that owns the results table
+            "_CBNAME_":           "selectPage", # action to perform
+            "_CBVALUE_":          str(page_num), # target page number
+            "_CBASYNCUPDATE_":    "true",      # AJAX update, not full page load
+            "_CBHTMLFRAG_":       "true",      # return HTML fragment only
+            "_CBHTMLFRAGNODEID_": fragnode,    # which async wrapper to return
+            "_CBHTMLFRAGID_":     str(int(time.time() * 1000)),  # cache-busting timestamp nonce
         },
-        headers={"Referer": f"{BASE_URL}/csa-party/viewInstance/view.html?id={view_id}"},
+        headers={
+            "Referer": f"{BASE_URL}/csa-party/viewInstance/view.html?id={view_id}",  # proves request came from our session page
+        },
     )
     r.raise_for_status()
     return BeautifulSoup(r.text, "html.parser")
